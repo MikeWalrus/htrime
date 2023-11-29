@@ -7,7 +7,9 @@ edition = "2021"
 
 [dependencies]
 cairo-rs = { version = "0.18.3", features = ["v1_18"] }
+env_logger = "0.10.1"
 libc = "0.2.150"
+log = "0.4.20"
 wayland-client = "0.31.1"
 wayland-egl = "0.32.0"
 wayland-protocols = "0.31.0"

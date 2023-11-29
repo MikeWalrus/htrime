@@ -1,18 +1,22 @@
-use std::ffi::{CStr, CString};
-use std::os::fd::{self, AsRawFd, BorrowedFd};
-use std::ptr::{null, null_mut};
+use std::ffi::CString;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::raw::c_void;
+use std::ptr::null_mut;
 
-use libc::{ftruncate, mmap, shm_open, shm_unlink, O_CREAT, O_EXCL, O_RDWR};
+use libc::{
+    epoll_event, epoll_wait, ftruncate, mmap, shm_open, shm_unlink, EPOLL_CLOEXEC, EPOLL_CTL_ADD,
+    O_CREAT, O_EXCL, O_RDWR,
+};
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::WlCompositor;
-use wayland_client::protocol::wl_pointer::WlPointer;
+use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
+use wayland_client::protocol::wl_surface;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::protocol::{wl_display, wl_surface};
-use wayland_client::{delegate_noop, EventQueue, Proxy};
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
+use wayland_client::{EventQueue, Proxy, WEnum};
 
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
@@ -20,6 +24,8 @@ use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface
 use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_v2, zwp_input_popup_surface_v2,
 };
+
+use log::{info, trace};
 
 const NAME: &str = "htrime";
 
@@ -31,6 +37,7 @@ struct Globals {
 }
 
 struct State {
+    conn: Connection,
     shm: WlShm,
     shm_pool: WlShmPool,
     pointer: WlPointer,
@@ -38,6 +45,13 @@ struct State {
     popup: ZwpInputPopupSurfaceV2,
     surface: WlSurface,
     cairo_surface: cairo::ImageSurface,
+    cairo_ctx: cairo::Context,
+    width: i32,
+    height: i32,
+    strokes: Vec<Stroke>,
+    is_pen_down: bool,
+    buffer: WlBuffer,
+    data_ptr: *mut c_void,
 }
 
 impl Globals {
@@ -51,10 +65,82 @@ impl Globals {
     }
 }
 
+struct InkPoint {
+    x: f64,
+    y: f64,
+    time: u32,
+    pressure: f64,
+}
+
+struct Stroke {
+    points: Vec<InkPoint>,
+}
+
 fn main() {
+    env_logger::init();
+
     let (mut state, mut wayland_queue) = init();
+
+    let wayland_fd = state.conn.as_fd().as_raw_fd();
+    let mut wayland_event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: wayland_fd as u64,
+    };
+    let epoll_fd = unsafe {
+        let epoll_fd = libc::epoll_create1(EPOLL_CLOEXEC);
+        assert!(epoll_fd >= 0);
+        let ret = libc::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wayland_fd, &mut wayland_event);
+        assert!(ret >= 0);
+        epoll_fd
+    };
+    const MAXEVENTS: usize = 16;
+    let mut events = [epoll_event { events: 0, u64: 0 }; MAXEVENTS];
+
     loop {
-        wayland_queue.blocking_dispatch(&mut state).unwrap();
+        // flush the outgoing buffers to ensure that the server does receive the messages
+        // you've sent
+
+        wayland_queue.flush().unwrap();
+
+        // (this step is only relevant if other threads might be reading the socket as well)
+        // make sure you don't have any pending events if the event queue that might have been
+        // enqueued by other threads reading the socket
+        wayland_queue.dispatch_pending(&mut state).unwrap();
+
+        // This puts in place some internal synchronization to prepare for the fact that
+        // you're going to wait for events on the socket and read them, in case other threads
+        // are doing the same thing
+        let read_guard = wayland_queue.prepare_read().unwrap();
+
+        /*
+         * At this point you can invoke epoll(..) to wait for readiness on the multiple FD you
+         * are working with, and read_guard.connection_fd() will give you the FD to wait on for
+         * the Wayland connection
+         */
+        let mut wayland_socket_ready = false;
+        unsafe {
+            let num_event = epoll_wait(epoll_fd, events.as_mut_ptr(), MAXEVENTS as i32, 1000);
+            assert!(num_event >= 0);
+            if events.iter().any(|e| e.u64 == wayland_fd as u64) {
+                wayland_socket_ready = true;
+            }
+        }
+
+        if wayland_socket_ready {
+            // If epoll notified readiness of the Wayland socket, you can now proceed to the read
+            read_guard.read().unwrap();
+            // And now, you must invoke dispatch_pending() to actually process the events
+
+            wayland_queue.dispatch_pending(&mut state).unwrap();
+        } else {
+            // otherwise, some of your other FD are ready, but you didn't receive Wayland events,
+            // you can drop the guard to cancel the read preparation
+            std::mem::drop(read_guard);
+        }
+
+        /*
+         * There you process all relevant events from your other event sources
+         */
     }
 }
 
@@ -95,12 +181,7 @@ fn init() -> (State, EventQueue<State>) {
     conn.display()
         .get_registry(&registry_qh, wayland_qh.clone());
 
-    let mut state = Globals {
-        input_method_manager: None,
-        seat: None,
-        compositor: None,
-        shm: None,
-    };
+    let mut state = Globals::new();
     registry_queue.roundtrip(&mut state).unwrap();
 
     let compositor = state.compositor.unwrap();
@@ -123,9 +204,9 @@ fn init() -> (State, EventQueue<State>) {
         &wayland_qh,
         (),
     );
-    let buffer_size = stride * height * width;
+    let buffer_size = stride * height;
 
-    let data = unsafe {
+    let data_ptr = unsafe {
         mmap(
             null_mut::<libc::c_void>(),
             buffer_size as usize,
@@ -136,15 +217,11 @@ fn init() -> (State, EventQueue<State>) {
         )
     };
     let data: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(data as *mut u8, buffer_size as usize) };
+        unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut u8, buffer_size as usize) };
 
     let pointer = seat.get_pointer(&wayland_qh, ());
 
     let surface = compositor.create_surface(&wayland_qh, ());
-
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage(0, 0, i32::MAX, i32::MAX);
-    surface.commit();
 
     let input_method = manager.get_input_method(&seat, &wayland_qh, ());
 
@@ -154,9 +231,9 @@ fn init() -> (State, EventQueue<State>) {
         cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, width, height, stride)
             .unwrap();
     let ctx = cairo::Context::new(&cairo_surface).unwrap();
-    ctx.set_source_rgba(1.0, 0.0, 0.0, 1.0);
-    ctx.rectangle(0., 0., 100., 100.);
-    ctx.fill().unwrap();
+
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+    ctx.paint().unwrap();
 
     surface.attach(Some(&buffer), 0, 0);
     surface.damage(0, 0, i32::MAX, i32::MAX);
@@ -171,6 +248,14 @@ fn init() -> (State, EventQueue<State>) {
             cairo_surface,
             popup,
             shm_pool,
+            conn,
+            strokes: vec![],
+            is_pen_down: false,
+            cairo_ctx: ctx,
+            buffer,
+            data_ptr,
+            width,
+            height,
         },
         wayland_queue,
     )
@@ -218,89 +303,89 @@ impl Dispatch<wl_registry::WlRegistry, QueueHandle<State>> for Globals {
 
 impl Dispatch<WlCompositor, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &WlCompositor,
-        event: <WlCompositor as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &WlCompositor,
+        _event: <WlCompositor as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("compositor event");
+        trace!("compositor event");
     }
 }
 impl Dispatch<WlShmPool, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &WlShmPool,
-        event: <WlShmPool as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &WlShmPool,
+        _event: <WlShmPool as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("shm pool event");
+        trace!("shm pool event");
     }
 }
 impl Dispatch<WlBuffer, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &WlBuffer,
-        event: <WlBuffer as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &WlBuffer,
+        _event: <WlBuffer as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("buffer event")
+        trace!("buffer event")
     }
 }
 impl Dispatch<ZwpInputMethodManagerV2, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &ZwpInputMethodManagerV2,
-        event: <ZwpInputMethodManagerV2 as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &ZwpInputMethodManagerV2,
+        _event: <ZwpInputMethodManagerV2 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("input method manager event");
+        trace!("input method manager event");
     }
 }
 
 impl Dispatch<WlSeat, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &WlSeat,
-        event: <WlSeat as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &WlSeat,
+        _event: <WlSeat as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("seat event");
+        trace!("seat event");
     }
 }
 
 impl Dispatch<WlShm, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &WlShm,
-        event: <WlShm as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &WlShm,
+        _event: <WlShm as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("shm event");
+        trace!("shm event");
     }
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for Globals {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _: &wl_surface::WlSurface,
-        _: wl_surface::Event,
+        event: wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        println!("surface event");
+        trace!("surface event");
     }
 }
 
@@ -313,25 +398,23 @@ impl Dispatch<ZwpInputMethodV2, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        println!("input method event");
+        trace!("input method event");
         if let zwp_input_method_v2::Event::Unavailable = event {
             panic!("Input method unavailable.")
         }
     }
 }
 
-struct SetPopupDone(bool);
-
 impl Dispatch<ZwpInputPopupSurfaceV2, ()> for State {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _: &ZwpInputPopupSurfaceV2,
         event: <ZwpInputPopupSurfaceV2 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        println!("popup event");
+        trace!("popup event");
         if let zwp_input_popup_surface_v2::Event::TextInputRectangle {
             x,
             y,
@@ -339,33 +422,107 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for State {
             height,
         } = event
         {
-            println!("x: {}, y: {}, width: {}, height: {}", x, y, width, height)
+            trace!("x: {}, y: {}, width: {}, height: {}", x, y, width, height)
         }
     }
 }
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &WlSurface,
-        event: <WlSurface as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &WlSurface,
+        _event: <WlSurface as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("surface event");
+        trace!("surface event");
     }
 }
 
 impl Dispatch<WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        proxy: &WlPointer,
+        _proxy: &WlPointer,
         event: <WlPointer as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        println!("pointer event");
+        match event {
+            wayland_client::protocol::wl_pointer::Event::Enter {
+                serial,
+                surface,
+                surface_x,
+                surface_y,
+            } => {
+                trace!("enter")
+            }
+            wayland_client::protocol::wl_pointer::Event::Leave { serial, surface } => {
+                trace!("leave");
+                if state.is_pen_down && surface == state.surface {
+                    state.is_pen_down = false;
+                    info!("pen up");
+                }
+            }
+            wayland_client::protocol::wl_pointer::Event::Motion {
+                time,
+                surface_x,
+                surface_y,
+            } => {
+                trace!("motion: {time} {surface_x}, {surface_y}");
+                if state.is_pen_down {
+                    state.strokes.last_mut().unwrap().points.push(InkPoint {
+                        x: surface_x,
+                        y: surface_y,
+                        time,
+                        pressure: 1.0,
+                    });
+                    trace!("add point ({surface_x}, {surface_y}) at {time}");
+                    state.draw();
+                }
+            }
+            wayland_client::protocol::wl_pointer::Event::Button {
+                serial,
+                time,
+                button,
+                state: button_state,
+            } => {
+                trace!("button: {serial} {time} {button} {button_state:?}");
+                if let WEnum::Value(ButtonState::Pressed) = button_state {
+                    state.is_pen_down = true;
+                    state.strokes.push(Stroke { points: vec![] });
+                    info!("pen down");
+                } else {
+                    state.is_pen_down = false;
+                    info!("pen up");
+                }
+            }
+            _ => {
+                trace!("other pointer event")
+            }
+        }
+    }
+}
+
+impl State {
+    fn draw(&mut self) {
+        info!("draw");
+        self.cairo_ctx.set_source_rgba(0., 0., 0., 1.);
+        self.cairo_ctx.set_line_width(5.);
+        for stroke in &self.strokes {
+            let mut points = stroke.points.iter();
+            if let Some(first) = points.next() {
+                self.cairo_ctx.move_to(first.x, first.y);
+                for point in points {
+                    self.cairo_ctx.line_to(point.x, point.y);
+                }
+                self.cairo_ctx.stroke().unwrap();
+            }
+        }
+
+        self.surface.attach(Some(&self.buffer), 0, 0);
+        self.surface.damage(0, 0, i32::MAX, i32::MAX);
+        self.surface.commit();
     }
 }
