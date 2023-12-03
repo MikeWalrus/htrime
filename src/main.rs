@@ -4,12 +4,12 @@ use std::ffi::CString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::raw::c_void;
-use std::process::Child;
+use std::process::{Child, ChildStdout};
 use std::ptr::null_mut;
 
 use libc::{
-    epoll_event, epoll_wait, fcntl, ftruncate, mmap, poll, shm_open, shm_unlink, EPOLL_CLOEXEC,
-    EPOLL_CTL_ADD, F_GETFL, F_SETFL, MAP_SHARED, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR, PROT_READ,
+    epoll_event, epoll_wait, fcntl, ftruncate, mmap, poll, shm_open, EPOLL_CLOEXEC,
+    EPOLL_CTL_ADD, F_GETFL, F_SETFL, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR,
 };
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -23,7 +23,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
 use wayland_client::{EventQueue, Proxy, WEnum};
 
-use wayland_protocols::wp::primary_selection::zv1::client::__interfaces::ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE;
+
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
 };
@@ -34,11 +34,11 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_v2, zwp_input_popup_surface_v2,
 };
 
-use log::{error, info, trace, warn};
-use xkbcommon::xkb::ffi::xkb_state_key_get_utf8;
-use xkbcommon::xkb::keysyms::KEY_BackSpace;
+use log::{info, trace, warn};
+
+
 use xkbcommon::xkb::{
-    self, Keymap, CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
+    Keymap, CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
 };
 
 const NAME: &str = "htrime";
@@ -105,37 +105,15 @@ fn main() {
 
     let (mut state, mut wayland_queue) = init();
 
-    let recognition_fd = state.recognition.stdout.as_ref().unwrap().as_raw_fd();
-    let mut recognition_event = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: recognition_fd as u64,
-    };
-    let handle = state.recognition.stdout.take().unwrap();
-    set_nonblocking(&handle, true).unwrap();
-    let mut recognition_reader = BufReader::new(handle);
+    let epoll_fd = unsafe { libc::epoll_create1(EPOLL_CLOEXEC) };
+    assert!(epoll_fd >= 0);
+
+    let (recognition_fd, mut recognition_reader) = epoll_add_recoginition(&mut state, epoll_fd);
     let mut recognition_output = String::new();
 
-    let wayland_fd = state.conn.as_fd().as_raw_fd();
-    let mut wayland_event = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: wayland_fd as u64,
-    };
-    let epoll_fd = unsafe {
-        let epoll_fd = libc::epoll_create1(EPOLL_CLOEXEC);
-        assert!(epoll_fd >= 0);
-        let ret = libc::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wayland_fd, &mut wayland_event);
-        assert!(ret >= 0);
-        let ret = libc::epoll_ctl(
-            epoll_fd,
-            EPOLL_CTL_ADD,
-            recognition_fd,
-            &mut recognition_event,
-        );
-        assert!(ret >= 0);
-        epoll_fd
-    };
-    const MAXEVENTS: usize = 16;
-    let mut events = [epoll_event { events: 0, u64: 0 }; MAXEVENTS];
+    let wayland_fd = epoll_add_wayland(&state, epoll_fd);
+    const MAX_EVENTS: usize = 16;
+    let mut events = [epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
 
     loop {
         // flush the outgoing buffers to ensure that the server does receive the messages
@@ -161,7 +139,7 @@ fn main() {
         let mut wayland_socket_ready = false;
         let mut recognition_ready = false;
         unsafe {
-            let num_event = epoll_wait(epoll_fd, events.as_mut_ptr(), MAXEVENTS as i32, 1000);
+            let num_event = epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EVENTS as i32, 1000);
             assert!(num_event >= 0);
             if num_event == 0 {
                 continue;
@@ -200,7 +178,6 @@ fn main() {
                 let ret = poll(&mut poll_fds as *mut _, 1, 0);
                 if ret == 0 {
                     panic!("poll timeout");
-                    continue;
                 }
             }
             if recognition_output.ends_with('\n') {
@@ -227,6 +204,38 @@ fn main() {
             state.input_method.commit(state.input_method_serial);
         }
     }
+}
+
+fn epoll_add_wayland(state: &State, epoll_fd: i32) -> i32 {
+    let wayland_fd = state.conn.as_fd().as_raw_fd();
+    let mut wayland_event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: wayland_fd as u64,
+    };
+    let ret = unsafe { libc::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wayland_fd, &mut wayland_event) };
+    assert!(ret >= 0);
+    wayland_fd
+}
+
+fn epoll_add_recoginition(state: &mut State, epoll_fd: i32) -> (i32, BufReader<ChildStdout>) {
+    let recognition_fd = state.recognition.stdout.as_ref().unwrap().as_raw_fd();
+    let mut recognition_event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: recognition_fd as u64,
+    };
+    let ret = unsafe {
+        libc::epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_ADD,
+            recognition_fd,
+            &mut recognition_event,
+        )
+    };
+    assert!(ret >= 0);
+    let handle = state.recognition.stdout.take().unwrap();
+    set_nonblocking(&handle, true).unwrap();
+    let recognition_reader = BufReader::new(handle);
+    (recognition_fd, recognition_reader)
 }
 
 fn set_nonblocking<H>(handle: &H, nonblocking: bool) -> std::io::Result<()>
@@ -333,7 +342,7 @@ fn init() -> (State, EventQueue<State>) {
 
     let popup = input_method.get_input_popup_surface(&surface, &wayland_qh, ());
 
-    let keyboard_grab = input_method.grab_keyboard(&wayland_qh, ());
+    let _keyboard_grab = input_method.grab_keyboard(&wayland_qh, ());
 
     let cairo_surface =
         cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, width, height, stride)
@@ -501,7 +510,7 @@ impl Dispatch<wl_surface::WlSurface, ()> for Globals {
     fn event(
         _state: &mut Self,
         _: &wl_surface::WlSurface,
-        event: wl_surface::Event,
+        _event: wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
@@ -587,14 +596,14 @@ impl Dispatch<WlPointer, ()> for State {
     ) {
         match event {
             wayland_client::protocol::wl_pointer::Event::Enter {
-                serial,
-                surface,
-                surface_x,
-                surface_y,
+                serial: _,
+                surface: _,
+                surface_x: _,
+                surface_y: _,
             } => {
                 trace!("enter")
             }
-            wayland_client::protocol::wl_pointer::Event::Leave { serial, surface } => {
+            wayland_client::protocol::wl_pointer::Event::Leave { serial: _, surface } => {
                 trace!("leave");
                 if state.is_pen_down && surface == state.surface {
                     state.is_pen_down = false;
@@ -653,11 +662,11 @@ impl Dispatch<WlPointer, ()> for State {
 impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
     fn event(
         state: &mut Self,
-        proxy: &ZwpInputMethodKeyboardGrabV2,
+        _proxy: &ZwpInputMethodKeyboardGrabV2,
         event: <ZwpInputMethodKeyboardGrabV2 as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
         match event {
             zwp_input_method_keyboard_grab_v2::Event::Keymap { format, fd, size } => unsafe {
