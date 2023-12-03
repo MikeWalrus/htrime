@@ -6,6 +6,7 @@ pub fn run() -> Child {
         .arg("adaptor.py")
         .current_dir("/home/mike/repos/third-party/SimpleHTR/src")
         .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .stdout(Stdio::piped());
 
     command.spawn().expect("failed to execute child")

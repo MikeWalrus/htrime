@@ -7,7 +7,6 @@ use std::os::raw::c_void;
 use std::process::{Child, ChildStdout};
 use std::ptr::null_mut;
 
-
 use libc::{
     epoll_event, epoll_wait, fcntl, ftruncate, mmap, poll, shm_open, EPOLL_CLOEXEC, EPOLL_CTL_ADD,
     F_GETFL, F_SETFL, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR,
@@ -21,9 +20,16 @@ use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface;
 use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_client::{delegate_noop, event_created_child, EventQueue, Proxy, WEnum};
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
-use wayland_client::{EventQueue, Proxy, WEnum};
 
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_manager_v2::ZwpTabletManagerV2;
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_pad_v2::ZwpTabletPadV2;
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_seat_v2::{
+    self, ZwpTabletSeatV2, EVT_TABLET_ADDED_OPCODE, EVT_TOOL_ADDED_OPCODE,
+};
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::{self, ZwpTabletToolV2};
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_v2::ZwpTabletV2;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
 };
@@ -42,6 +48,7 @@ const NAME: &str = "htrime";
 
 struct Globals {
     input_method_manager: Option<ZwpInputMethodManagerV2>,
+    tablet_manager: Option<ZwpTabletManagerV2>,
     seat: Option<WlSeat>,
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
@@ -62,6 +69,8 @@ struct State {
     height: i32,
     strokes: Vec<Stroke>,
     is_pen_down: bool,
+    pressure: Option<u32>,
+    line_width: f64,
     buffer: WlBuffer,
     data_ptr: *mut c_void,
     xkb_state: Option<XkbState>,
@@ -82,6 +91,7 @@ impl Globals {
             seat: None,
             compositor: None,
             shm: None,
+            tablet_manager: None,
         }
     }
 }
@@ -90,7 +100,7 @@ struct InkPoint {
     x: f64,
     y: f64,
     time: u32,
-    pressure: f64,
+    pressure: Option<u32>,
 }
 
 struct Stroke {
@@ -293,14 +303,16 @@ fn init() -> (State, EventQueue<State>) {
     conn.display()
         .get_registry(&registry_qh, wayland_qh.clone());
 
-    let mut state = Globals::new();
-    registry_queue.roundtrip(&mut state).unwrap();
+    let mut globals = Globals::new();
+    registry_queue.roundtrip(&mut globals).unwrap();
 
-    let compositor = state.compositor.unwrap();
-    let manager = state.input_method_manager.unwrap();
-    let seat = state.seat.unwrap();
+    let compositor = globals.compositor.unwrap();
+    let manager = globals.input_method_manager.unwrap();
+    let seat = globals.seat.unwrap();
+    let tablet_manager = globals.tablet_manager.unwrap();
+    tablet_manager.get_tablet_seat(&seat, &wayland_qh, ());
 
-    let shm = state.shm.unwrap();
+    let shm = globals.shm.unwrap();
     let size = 1024 * 1024 * 1024;
     let fd = shm_file(size);
     let shm_pool = shm.create_pool(fd, size, &wayland_qh, ());
@@ -375,6 +387,8 @@ fn init() -> (State, EventQueue<State>) {
             recognition,
             preedit_text: String::new(),
             input_method_serial: 0,
+            pressure: None,
+            line_width: 4.,
         },
         wayland_queue,
     )
@@ -422,8 +436,38 @@ impl Dispatch<wl_registry::WlRegistry, QueueHandle<State>> for Globals {
                     let shm: WlShm = registry.bind(name, 1, handle, ());
                     state.shm = Some(shm);
                 }
+                "zwp_tablet_manager_v2" => {
+                    let tablet_manager = registry.bind(name, 1, handle, ());
+                    state.tablet_manager = Some(tablet_manager);
+                }
                 _ => {}
             }
+        }
+    }
+}
+
+impl Dispatch<ZwpTabletSeatV2, ()> for State {
+    event_created_child!(Self, ZwpTabletSeatV2, [
+       EVT_TABLET_ADDED_OPCODE => (ZwpTabletV2, ()),
+       EVT_TOOL_ADDED_OPCODE => (ZwpTabletToolV2, ()),
+    ]);
+
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletSeatV2,
+        event: <ZwpTabletSeatV2 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        trace!("tablet seat event");
+        match event {
+            zwp_tablet_seat_v2::Event::TabletAdded { id: _ } => {}
+            zwp_tablet_seat_v2::Event::ToolAdded { id: _ } => {
+                info!("tablet tool added");
+            }
+            zwp_tablet_seat_v2::Event::PadAdded { id: _ } => {}
+            _ => {}
         }
     }
 }
@@ -612,17 +656,7 @@ impl Dispatch<WlPointer, ()> for State {
                 surface_x,
                 surface_y,
             } => {
-                trace!("motion: {time} {surface_x}, {surface_y}");
-                if state.is_pen_down {
-                    state.draw_new_point(surface_x, surface_y);
-                    state.strokes.last_mut().unwrap().points.push(InkPoint {
-                        x: surface_x,
-                        y: surface_y,
-                        time,
-                        pressure: 1.0,
-                    });
-                    trace!("add point ({surface_x}, {surface_y}) at {time}");
-                }
+                state.on_motion(surface_x, surface_y, time);
             }
             wayland_client::protocol::wl_pointer::Event::Button {
                 serial,
@@ -632,21 +666,11 @@ impl Dispatch<WlPointer, ()> for State {
             } => {
                 trace!("button: {serial} {time} {button} {button_state:?}");
                 if let WEnum::Value(ButtonState::Pressed) = button_state {
-                    state.is_pen_down = true;
-                    state.strokes.push(Stroke { points: vec![] });
-                    info!("pen down, #{}", state.strokes.len());
+                    state.pressure = None;
+                    state.on_down();
                 } else {
-                    state.is_pen_down = false;
-
-                    state
-                        .recognition
-                        .stdin
-                        .as_ref()
-                        .unwrap()
-                        .write_all(format!("{} {}\n", state.width, state.height).as_bytes())
-                        .unwrap();
-                    state.recognition.stdin.as_ref().unwrap().flush().unwrap();
-                    info!("pen up");
+                    state.pressure = None;
+                    state.on_up();
                 }
             }
             _ => {
@@ -655,6 +679,59 @@ impl Dispatch<WlPointer, ()> for State {
         }
     }
 }
+
+impl Dispatch<ZwpTabletManagerV2, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTabletManagerV2,
+        _event: <ZwpTabletManagerV2 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        trace!("tablet manager event");
+    }
+}
+
+impl Dispatch<ZwpTabletToolV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpTabletToolV2,
+        event: <ZwpTabletToolV2 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_tablet_tool_v2::Event::Down { serial: _ } => {
+                state.on_down();
+            }
+            zwp_tablet_tool_v2::Event::Up => {
+                state.on_up();
+            }
+            zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                state.on_motion(x, y, 0); // TODO: no time available
+            }
+            zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                trace!("pressure: {}", pressure);
+                state.pressure = Some(pressure);
+            }
+            zwp_tablet_tool_v2::Event::Button {
+                serial,
+                button,
+                state: button_state,
+            } => {
+                trace!("button: {serial} {button} {button_state:?}");
+            }
+            _ => {
+                trace!("other tool event")
+            }
+        }
+    }
+}
+
+delegate_noop!(State: ignore ZwpTabletPadV2);
+delegate_noop!(State: ignore ZwpTabletV2);
 
 impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
     fn event(
@@ -741,9 +818,12 @@ impl State {
             if let Some(first) = points.next() {
                 self.cairo_ctx.move_to(first.x, first.y);
                 for point in points {
+                    self.set_pressure(point.pressure);
+                    trace!("draw point ({}, {}, {:?})", point.x, point.y, point.pressure);
                     self.cairo_ctx.line_to(point.x, point.y);
+                    self.cairo_ctx.stroke().unwrap();
+                    self.cairo_ctx.move_to(point.x, point.y);
                 }
-                self.cairo_ctx.stroke().unwrap();
             }
         }
 
@@ -756,11 +836,11 @@ impl State {
         self.surface.commit();
     }
 
-    fn draw_new_point(&mut self, x: f64, y: f64) {
+    fn draw_new_point(&mut self, x: f64, y: f64, pressure: Option<u32>) {
         trace!("draw new point ({}, {})", x, y);
-        set_line(&self.cairo_ctx);
         let stroke = self.strokes.last().unwrap();
         if let Some(point) = stroke.points.last() {
+            self.set_pressure(pressure);
             self.cairo_ctx.move_to(point.x, point.y);
             self.cairo_ctx.line_to(x, y);
             self.cairo_ctx.stroke().unwrap();
@@ -768,6 +848,48 @@ impl State {
             self.cairo_ctx.move_to(x, y);
         }
         self.display()
+    }
+
+    fn set_pressure(&self, pressure: Option<u32>) {
+        let line_width = if let Some(pressure) = pressure {
+            (pressure as f64 / 65535.) * self.line_width
+        } else {
+            self.line_width
+        };
+        self.cairo_ctx.set_line_width(line_width);
+    }
+
+    fn on_motion(&mut self, surface_x: f64, surface_y: f64, time: u32) {
+        trace!("motion: {time} {surface_x}, {surface_y}");
+        if self.is_pen_down {
+            self.draw_new_point(surface_x, surface_y, self.pressure);
+            self.strokes.last_mut().unwrap().points.push(InkPoint {
+                x: surface_x,
+                y: surface_y,
+                time,
+                pressure: self.pressure,
+            });
+            trace!("add point ({surface_x}, {surface_y}) at {time}");
+        }
+    }
+
+    fn on_down(&mut self) {
+        self.is_pen_down = true;
+        self.strokes.push(Stroke { points: vec![] });
+        info!("pen down, #{}", self.strokes.len());
+    }
+
+    fn on_up(&mut self) {
+        self.is_pen_down = false;
+
+        self.recognition
+            .stdin
+            .as_ref()
+            .unwrap()
+            .write_all(format!("{} {}\n", self.width, self.height).as_bytes())
+            .unwrap();
+        self.recognition.stdin.as_ref().unwrap().flush().unwrap();
+        info!("pen up");
     }
 }
 
