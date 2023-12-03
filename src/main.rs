@@ -56,6 +56,7 @@ struct Globals {
 
 struct State {
     conn: Connection,
+    wayland_qh: QueueHandle<Self>,
     shm: WlShm,
     shm_pool: WlShmPool,
     pointer: WlPointer,
@@ -67,6 +68,8 @@ struct State {
     cairo_ctx: cairo::Context,
     width: i32,
     height: i32,
+    original_width: i32,
+    original_height: i32,
     strokes: Vec<Stroke>,
     is_pen_down: bool,
     pressure: Option<u32>,
@@ -76,6 +79,8 @@ struct State {
     xkb_state: Option<XkbState>,
     recognition: Child,
     preedit_text: String,
+    max_x: f64,
+    max_y: f64,
 }
 
 struct XkbState {
@@ -316,32 +321,21 @@ fn init() -> (State, EventQueue<State>) {
     let size = 1024 * 1024 * 1024;
     let fd = shm_file(size);
     let shm_pool = shm.create_pool(fd, size, &wayland_qh, ());
-    let width = 500;
-    let height = 100;
+    let width = 200;
+    let height = 80;
     let stride = width * 4;
-    let buffer = shm_pool.create_buffer(
-        0,
-        width,
-        height,
-        stride,
-        wayland_client::protocol::wl_shm::Format::Argb8888,
-        &wayland_qh,
-        (),
-    );
     let buffer_size = stride * height;
 
     let data_ptr = unsafe {
         mmap(
             null_mut::<libc::c_void>(),
-            buffer_size as usize,
+            size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd.as_raw_fd(),
             0,
         )
     };
-    let data: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut u8, buffer_size as usize) };
 
     let pointer = seat.get_pointer(&wayland_qh, ());
 
@@ -352,6 +346,19 @@ fn init() -> (State, EventQueue<State>) {
     let popup = input_method.get_input_popup_surface(&surface, &wayland_qh, ());
 
     let _keyboard_grab = input_method.grab_keyboard(&wayland_qh, ());
+
+    let data: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut u8, buffer_size as usize) };
+
+    let buffer = shm_pool.create_buffer(
+        0,
+        width,
+        height,
+        stride,
+        wayland_client::protocol::wl_shm::Format::Argb8888,
+        &wayland_qh,
+        (),
+    );
 
     let cairo_surface =
         cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, width, height, stride)
@@ -365,33 +372,36 @@ fn init() -> (State, EventQueue<State>) {
     surface.commit();
 
     let recognition = recognition::run();
+    let state = State {
+        shm,
+        pointer,
+        input_method,
+        surface,
+        cairo_surface,
+        popup,
+        shm_pool,
+        conn,
+        strokes: vec![],
+        is_pen_down: false,
+        cairo_ctx: ctx,
+        buffer,
+        data_ptr,
+        width,
+        height,
+        xkb_state: None,
+        recognition,
+        preedit_text: String::new(),
+        input_method_serial: 0,
+        pressure: None,
+        line_width: 4.,
+        wayland_qh,
+        max_x: 0.,
+        max_y: 0.,
+        original_width: width,
+        original_height: height,
+    };
 
-    (
-        State {
-            shm,
-            pointer,
-            input_method,
-            surface,
-            cairo_surface,
-            popup,
-            shm_pool,
-            conn,
-            strokes: vec![],
-            is_pen_down: false,
-            cairo_ctx: ctx,
-            buffer,
-            data_ptr,
-            width,
-            height,
-            xkb_state: None,
-            recognition,
-            preedit_text: String::new(),
-            input_method_serial: 0,
-            pressure: None,
-            line_width: 4.,
-        },
-        wayland_queue,
-    )
+    (state, wayland_queue)
 }
 
 fn fill_background(ctx: &cairo::Context) {
@@ -792,7 +802,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
                                 state.input_method.commit_string(state.preedit_text.clone());
                                 state.input_method.commit(state.input_method_serial);
                                 state.strokes.clear();
-                                state.redraw();
+                                state.restore_size();
                                 info!("enter input");
                             }
                             _ => {
@@ -819,7 +829,12 @@ impl State {
                 self.cairo_ctx.move_to(first.x, first.y);
                 for point in points {
                     self.set_pressure(point.pressure);
-                    trace!("draw point ({}, {}, {:?})", point.x, point.y, point.pressure);
+                    trace!(
+                        "draw point ({}, {}, {:?})",
+                        point.x,
+                        point.y,
+                        point.pressure
+                    );
                     self.cairo_ctx.line_to(point.x, point.y);
                     self.cairo_ctx.stroke().unwrap();
                     self.cairo_ctx.move_to(point.x, point.y);
@@ -869,6 +884,8 @@ impl State {
                 time,
                 pressure: self.pressure,
             });
+            self.max_x = self.max_x.max(surface_x);
+            self.max_y = self.max_y.max(surface_y);
             trace!("add point ({surface_x}, {surface_y}) at {time}");
         }
     }
@@ -882,6 +899,8 @@ impl State {
     fn on_up(&mut self) {
         self.is_pen_down = false;
 
+        self.auto_resize();
+
         self.recognition
             .stdin
             .as_ref()
@@ -890,6 +909,50 @@ impl State {
             .unwrap();
         self.recognition.stdin.as_ref().unwrap().flush().unwrap();
         info!("pen up");
+    }
+
+    fn resize(&mut self, width: i32, height: i32) {
+        self.max_x = 0.;
+        self.max_y = 0.;
+        self.width = width;
+        self.height = height;
+        let stride = width * 4;
+        let buffer_size = stride * height;
+        let data: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(self.data_ptr as *mut u8, buffer_size as usize)
+        };
+        self.buffer.destroy();
+        self.buffer = self.shm_pool.create_buffer(
+            0,
+            width,
+            height,
+            stride,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &self.wayland_qh,
+            (),
+        );
+        self.cairo_surface = cairo::ImageSurface::create_for_data(
+            data,
+            cairo::Format::ARgb32,
+            width,
+            height,
+            stride,
+        )
+        .unwrap();
+        self.cairo_ctx = cairo::Context::new(&self.cairo_surface).unwrap();
+        self.redraw();
+        self.display();
+    }
+
+    fn auto_resize(&mut self) {
+        if self.max_x > self.width as f64 * 0.8 {
+            info!("auto resize max_x: {}", self.max_x);
+            self.resize(self.width + 100, self.height);
+        }
+    }
+
+    fn restore_size(&mut self) {
+        self.resize(self.original_width, self.original_height);
     }
 }
 
