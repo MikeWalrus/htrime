@@ -1,14 +1,19 @@
+mod recognition;
+
 use std::ffi::CString;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::raw::c_void;
+use std::process::Child;
 use std::ptr::null_mut;
 
 use libc::{
-    epoll_event, epoll_wait, ftruncate, mmap, shm_open, shm_unlink, EPOLL_CLOEXEC, EPOLL_CTL_ADD,
-    O_CREAT, O_EXCL, O_RDWR,
+    epoll_event, epoll_wait, fcntl, ftruncate, mmap, poll, shm_open, shm_unlink, EPOLL_CLOEXEC,
+    EPOLL_CTL_ADD, F_GETFL, F_SETFL, MAP_SHARED, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR, PROT_READ,
 };
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_keyboard::{KeyState, KeymapFormat};
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::WlShm;
@@ -18,6 +23,10 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
 use wayland_client::{EventQueue, Proxy, WEnum};
 
+use wayland_protocols::wp::primary_selection::zv1::client::__interfaces::ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE;
+use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_keyboard_grab_v2::{
+    self, ZwpInputMethodKeyboardGrabV2,
+};
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2;
@@ -25,7 +34,12 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_v2, zwp_input_popup_surface_v2,
 };
 
-use log::{info, trace};
+use log::{error, info, trace, warn};
+use xkbcommon::xkb::ffi::xkb_state_key_get_utf8;
+use xkbcommon::xkb::keysyms::KEY_BackSpace;
+use xkbcommon::xkb::{
+    self, Keymap, CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
+};
 
 const NAME: &str = "htrime";
 
@@ -42,6 +56,7 @@ struct State {
     shm_pool: WlShmPool,
     pointer: WlPointer,
     input_method: ZwpInputMethodV2,
+    input_method_serial: u32,
     popup: ZwpInputPopupSurfaceV2,
     surface: WlSurface,
     cairo_surface: cairo::ImageSurface,
@@ -52,6 +67,15 @@ struct State {
     is_pen_down: bool,
     buffer: WlBuffer,
     data_ptr: *mut c_void,
+    xkb_state: Option<XkbState>,
+    recognition: Child,
+    preedit_text: String,
+}
+
+struct XkbState {
+    keymap: Keymap,
+    xkb_context: xkbcommon::xkb::Context,
+    state: xkbcommon::xkb::State,
 }
 
 impl Globals {
@@ -81,6 +105,16 @@ fn main() {
 
     let (mut state, mut wayland_queue) = init();
 
+    let recognition_fd = state.recognition.stdout.as_ref().unwrap().as_raw_fd();
+    let mut recognition_event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: recognition_fd as u64,
+    };
+    let handle = state.recognition.stdout.take().unwrap();
+    set_nonblocking(&handle, true).unwrap();
+    let mut recognition_reader = BufReader::new(handle);
+    let mut recognition_output = String::new();
+
     let wayland_fd = state.conn.as_fd().as_raw_fd();
     let mut wayland_event = libc::epoll_event {
         events: libc::EPOLLIN as u32,
@@ -90,6 +124,13 @@ fn main() {
         let epoll_fd = libc::epoll_create1(EPOLL_CLOEXEC);
         assert!(epoll_fd >= 0);
         let ret = libc::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wayland_fd, &mut wayland_event);
+        assert!(ret >= 0);
+        let ret = libc::epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_ADD,
+            recognition_fd,
+            &mut recognition_event,
+        );
         assert!(ret >= 0);
         epoll_fd
     };
@@ -118,11 +159,19 @@ fn main() {
          * the Wayland connection
          */
         let mut wayland_socket_ready = false;
+        let mut recognition_ready = false;
         unsafe {
             let num_event = epoll_wait(epoll_fd, events.as_mut_ptr(), MAXEVENTS as i32, 1000);
             assert!(num_event >= 0);
-            if events.iter().any(|e| e.u64 == wayland_fd as u64) {
-                wayland_socket_ready = true;
+            if num_event == 0 {
+                continue;
+            }
+            for e in events.iter().take(num_event as usize) {
+                if e.u64 == wayland_fd as u64 {
+                    wayland_socket_ready = true;
+                } else if e.u64 == recognition_fd as u64 {
+                    recognition_ready = true;
+                }
             }
         }
 
@@ -141,7 +190,64 @@ fn main() {
         /*
          * There you process all relevant events from your other event sources
          */
+        if recognition_ready {
+            unsafe {
+                let mut poll_fds = [libc::pollfd {
+                    fd: recognition_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }];
+                let ret = poll(&mut poll_fds as *mut _, 1, 0);
+                if ret == 0 {
+                    panic!("poll timeout");
+                    continue;
+                }
+            }
+            if recognition_output.ends_with('\n') {
+                recognition_output.clear();
+            }
+            if let Err(e) = recognition_reader.read_line(&mut recognition_output) {
+                if e.raw_os_error() == Some(libc::EAGAIN) {
+                    warn!("Incomplete line {:?} {e:?}", recognition_output);
+                    continue;
+                } else {
+                    panic!("Failed to read from child: {}", e);
+                }
+            }
+            trace!("recognition output: {}", recognition_output);
+            let header = "recognized:";
+            if let Some(s) = recognition_output.strip_prefix(header) {
+                state.preedit_text.clear();
+                state.preedit_text.push_str(s.trim());
+                info!("preedit text: {:?}", state.preedit_text);
+            }
+            state
+                .input_method
+                .set_preedit_string(state.preedit_text.clone(), 0, 0);
+            state.input_method.commit(state.input_method_serial);
+        }
     }
+}
+
+fn set_nonblocking<H>(handle: &H, nonblocking: bool) -> std::io::Result<()>
+where
+    H: Read + AsRawFd,
+{
+    let fd = handle.as_raw_fd();
+    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if nonblocking {
+        flags | O_NONBLOCK
+    } else {
+        flags & !O_NONBLOCK
+    };
+    let res = unsafe { fcntl(fd, F_SETFL, flags) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn shm_file(size: i32) -> BorrowedFd<'static> {
@@ -152,7 +258,7 @@ fn shm_file(size: i32) -> BorrowedFd<'static> {
         if fd < 0 {
             panic!("shm_open failed")
         }
-        shm_unlink(name_ptr);
+        // shm_unlink(name_ptr);
         loop {
             let ret = ftruncate(fd, size as i64);
             if ret < 0 {
@@ -227,17 +333,20 @@ fn init() -> (State, EventQueue<State>) {
 
     let popup = input_method.get_input_popup_surface(&surface, &wayland_qh, ());
 
+    let keyboard_grab = input_method.grab_keyboard(&wayland_qh, ());
+
     let cairo_surface =
         cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, width, height, stride)
             .unwrap();
     let ctx = cairo::Context::new(&cairo_surface).unwrap();
 
-    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.9);
-    ctx.paint().unwrap();
+    fill_background(&ctx);
 
     surface.attach(Some(&buffer), 0, 0);
     surface.damage(0, 0, i32::MAX, i32::MAX);
     surface.commit();
+
+    let recognition = recognition::run();
 
     (
         State {
@@ -256,9 +365,21 @@ fn init() -> (State, EventQueue<State>) {
             data_ptr,
             width,
             height,
+            xkb_state: None,
+            recognition,
+            preedit_text: String::new(),
+            input_method_serial: 0,
         },
         wayland_queue,
     )
+}
+
+fn fill_background(ctx: &cairo::Context) {
+    ctx.save().unwrap();
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    ctx.set_operator(cairo::Operator::Source);
+    ctx.paint().unwrap();
+    ctx.restore().unwrap();
 }
 
 const ZWP_INPUT_METHOD_MANAGER_V2_VERSION: u32 = 1;
@@ -399,8 +520,23 @@ impl Dispatch<ZwpInputMethodV2, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         trace!("input method event");
-        if let zwp_input_method_v2::Event::Unavailable = event {
-            panic!("Input method unavailable.")
+        match event {
+            zwp_input_method_v2::Event::Activate => {
+                info!("activate");
+            }
+            zwp_input_method_v2::Event::Deactivate => {
+                info!("deactivate");
+            }
+            zwp_input_method_v2::Event::Done => {
+                state.input_method_serial += 1;
+                trace!("done");
+            }
+            zwp_input_method_v2::Event::Unavailable => {
+                panic!("Input method unavailable.")
+            }
+            _ => {
+                trace!("other input method event")
+            }
         }
     }
 }
@@ -492,9 +628,18 @@ impl Dispatch<WlPointer, ()> for State {
                 if let WEnum::Value(ButtonState::Pressed) = button_state {
                     state.is_pen_down = true;
                     state.strokes.push(Stroke { points: vec![] });
-                    info!("pen down");
+                    info!("pen down, #{}", state.strokes.len());
                 } else {
                     state.is_pen_down = false;
+
+                    state
+                        .recognition
+                        .stdin
+                        .as_ref()
+                        .unwrap()
+                        .write_all(format!("{} {}\n", state.width, state.height).as_bytes())
+                        .unwrap();
+                    state.recognition.stdin.as_ref().unwrap().flush().unwrap();
                     info!("pen up");
                 }
             }
@@ -505,11 +650,90 @@ impl Dispatch<WlPointer, ()> for State {
     }
 }
 
+impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwpInputMethodKeyboardGrabV2,
+        event: <ZwpInputMethodKeyboardGrabV2 as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_input_method_keyboard_grab_v2::Event::Keymap { format, fd, size } => unsafe {
+                if let WEnum::Value(KeymapFormat::XkbV1) = format {
+                    info!("XKB V1 Keymap");
+                    let context = xkbcommon::xkb::Context::new(CONTEXT_NO_FLAGS);
+                    let keymap = Keymap::new_from_fd(
+                        &context,
+                        fd,
+                        size as usize,
+                        KEYMAP_FORMAT_TEXT_V1,
+                        KEYMAP_COMPILE_NO_FLAGS,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let xkb_state = xkbcommon::xkb::State::new(&keymap);
+                    state.xkb_state = Some(XkbState {
+                        keymap,
+                        xkb_context: context,
+                        state: xkb_state,
+                    });
+                } else {
+                    panic!("Unsupported keymap format")
+                }
+            },
+            zwp_input_method_keyboard_grab_v2::Event::Key {
+                serial,
+                time,
+                key,
+                state: key_state,
+            } => {
+                trace!("key: {serial} {time} {key} {key_state:?}");
+                if let WEnum::Value(KeyState::Pressed) = key_state {
+                    let c = state
+                        .xkb_state
+                        .as_ref()
+                        .unwrap()
+                        .state
+                        .key_get_one_sym((key + 8).into());
+                    info!("key: {c:?}");
+                    if let Some(c) = c.key_char() {
+                        match c {
+                            'z' => {
+                                state.strokes.pop();
+                                state.draw();
+                                info!("undo stroke");
+                            }
+                            '\r' => {
+                                state.input_method.commit_string(state.preedit_text.clone());
+                                state.input_method.commit(state.input_method_serial);
+                                state.strokes.clear();
+                                state.draw();
+                                info!("enter input");
+                            }
+                            _ => {
+                                info!("unhandled key: {c:?}")
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                trace!("other keyboard grab event")
+            }
+        }
+    }
+}
+
 impl State {
     fn draw(&mut self) {
-        info!("draw");
+        trace!("draw");
+        fill_background(&self.cairo_ctx);
+        self.cairo_ctx.set_line_cap(cairo::LineCap::Round);
+        self.cairo_ctx.set_line_join(cairo::LineJoin::Round);
         self.cairo_ctx.set_source_rgba(0., 0., 0., 1.);
-        self.cairo_ctx.set_line_width(5.);
+        self.cairo_ctx.set_line_width(3.);
         for stroke in &self.strokes {
             let mut points = stroke.points.iter();
             if let Some(first) = points.next() {
