@@ -7,9 +7,10 @@ use std::os::raw::c_void;
 use std::process::{Child, ChildStdout};
 use std::ptr::null_mut;
 
+
 use libc::{
-    epoll_event, epoll_wait, fcntl, ftruncate, mmap, poll, shm_open, EPOLL_CLOEXEC,
-    EPOLL_CTL_ADD, F_GETFL, F_SETFL, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR,
+    epoll_event, epoll_wait, fcntl, ftruncate, mmap, poll, shm_open, EPOLL_CLOEXEC, EPOLL_CTL_ADD,
+    F_GETFL, F_SETFL, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR,
 };
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -23,7 +24,6 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
 use wayland_client::{EventQueue, Proxy, WEnum};
 
-
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
 };
@@ -36,10 +36,7 @@ use wayland_protocols_misc::zwp_input_method_v2::client::{
 
 use log::{info, trace, warn};
 
-
-use xkbcommon::xkb::{
-    Keymap, CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1,
-};
+use xkbcommon::xkb::{Keymap, CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS, KEYMAP_FORMAT_TEXT_V1};
 
 const NAME: &str = "htrime";
 
@@ -348,7 +345,7 @@ fn init() -> (State, EventQueue<State>) {
         cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, width, height, stride)
             .unwrap();
     let ctx = cairo::Context::new(&cairo_surface).unwrap();
-
+    set_line(&ctx);
     fill_background(&ctx);
 
     surface.attach(Some(&buffer), 0, 0);
@@ -617,6 +614,7 @@ impl Dispatch<WlPointer, ()> for State {
             } => {
                 trace!("motion: {time} {surface_x}, {surface_y}");
                 if state.is_pen_down {
+                    state.draw_new_point(surface_x, surface_y);
                     state.strokes.last_mut().unwrap().points.push(InkPoint {
                         x: surface_x,
                         y: surface_y,
@@ -624,7 +622,6 @@ impl Dispatch<WlPointer, ()> for State {
                         pressure: 1.0,
                     });
                     trace!("add point ({surface_x}, {surface_y}) at {time}");
-                    state.draw();
                 }
             }
             wayland_client::protocol::wl_pointer::Event::Button {
@@ -711,14 +708,14 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
                         match c {
                             'z' => {
                                 state.strokes.pop();
-                                state.draw();
+                                state.redraw();
                                 info!("undo stroke");
                             }
                             '\r' => {
                                 state.input_method.commit_string(state.preedit_text.clone());
                                 state.input_method.commit(state.input_method_serial);
                                 state.strokes.clear();
-                                state.draw();
+                                state.redraw();
                                 info!("enter input");
                             }
                             _ => {
@@ -736,13 +733,9 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
 }
 
 impl State {
-    fn draw(&mut self) {
-        trace!("draw");
+    fn redraw(&mut self) {
+        trace!("redraw");
         fill_background(&self.cairo_ctx);
-        self.cairo_ctx.set_line_cap(cairo::LineCap::Round);
-        self.cairo_ctx.set_line_join(cairo::LineJoin::Round);
-        self.cairo_ctx.set_source_rgba(0., 0., 0., 1.);
-        self.cairo_ctx.set_line_width(3.);
         for stroke in &self.strokes {
             let mut points = stroke.points.iter();
             if let Some(first) = points.next() {
@@ -754,8 +747,33 @@ impl State {
             }
         }
 
+        self.display();
+    }
+
+    fn display(&mut self) {
         self.surface.attach(Some(&self.buffer), 0, 0);
         self.surface.damage(0, 0, i32::MAX, i32::MAX);
         self.surface.commit();
     }
+
+    fn draw_new_point(&mut self, x: f64, y: f64) {
+        trace!("draw new point ({}, {})", x, y);
+        set_line(&self.cairo_ctx);
+        let stroke = self.strokes.last().unwrap();
+        if let Some(point) = stroke.points.last() {
+            self.cairo_ctx.move_to(point.x, point.y);
+            self.cairo_ctx.line_to(x, y);
+            self.cairo_ctx.stroke().unwrap();
+        } else {
+            self.cairo_ctx.move_to(x, y);
+        }
+        self.display()
+    }
+}
+
+fn set_line(ctx: &cairo::Context) {
+    ctx.set_line_cap(cairo::LineCap::Round);
+    ctx.set_line_join(cairo::LineJoin::Round);
+    ctx.set_source_rgba(0., 0., 0., 1.);
+    ctx.set_line_width(3.);
 }
