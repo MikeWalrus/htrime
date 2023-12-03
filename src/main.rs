@@ -28,7 +28,9 @@ use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_pad_v2::ZwpTabletPadV
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_seat_v2::{
     self, ZwpTabletSeatV2, EVT_TABLET_ADDED_OPCODE, EVT_TOOL_ADDED_OPCODE,
 };
-use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::{self, ZwpTabletToolV2};
+use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::{
+    self, ZwpTabletToolV2,
+};
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_v2::ZwpTabletV2;
 use wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
@@ -372,7 +374,7 @@ fn init() -> (State, EventQueue<State>) {
     surface.commit();
 
     let recognition = recognition::run();
-    let state = State {
+    let mut state = State {
         shm,
         pointer,
         input_method,
@@ -731,7 +733,20 @@ impl Dispatch<ZwpTabletToolV2, ()> for State {
                 button,
                 state: button_state,
             } => {
-                trace!("button: {serial} {button} {button_state:?}");
+                info!("button: {serial} {button} {button_state:?}");
+                if let WEnum::Value(zwp_tablet_tool_v2::ButtonState::Pressed) = button_state {
+                    match button {
+                        331 => {
+                            state.enter_input();
+                        }
+                        332 => {
+                            state.undo();
+                        }
+                        _ => {
+                            warn!("unhandled pen button: {}", button)
+                        }
+                    }
+                }
             }
             _ => {
                 trace!("other tool event")
@@ -794,16 +809,10 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for State {
                     if let Some(c) = c.key_char() {
                         match c {
                             'z' => {
-                                state.strokes.pop();
-                                state.redraw();
-                                info!("undo stroke");
+                                state.undo();
                             }
                             '\r' => {
-                                state.input_method.commit_string(state.preedit_text.clone());
-                                state.input_method.commit(state.input_method_serial);
-                                state.strokes.clear();
-                                state.restore_size();
-                                info!("enter input");
+                                state.enter_input();
                             }
                             _ => {
                                 info!("unhandled key: {c:?}")
@@ -901,6 +910,11 @@ impl State {
 
         self.auto_resize();
 
+        self.recognize();
+        info!("pen up");
+    }
+
+    fn recognize(&mut self) {
         self.recognition
             .stdin
             .as_ref()
@@ -908,7 +922,6 @@ impl State {
             .write_all(format!("{} {}\n", self.width, self.height).as_bytes())
             .unwrap();
         self.recognition.stdin.as_ref().unwrap().flush().unwrap();
-        info!("pen up");
     }
 
     fn resize(&mut self, width: i32, height: i32) {
@@ -953,6 +966,22 @@ impl State {
 
     fn restore_size(&mut self) {
         self.resize(self.original_width, self.original_height);
+    }
+
+    fn enter_input(&mut self) {
+        self.input_method.commit_string(self.preedit_text.clone());
+        self.input_method.commit(self.input_method_serial);
+        self.strokes.clear();
+        self.preedit_text.clear();
+        self.restore_size();
+        info!("enter input");
+    }
+
+    fn undo(&mut self) {
+        self.strokes.pop();
+        self.redraw();
+        self.recognize();
+        info!("undo stroke");
     }
 }
 
