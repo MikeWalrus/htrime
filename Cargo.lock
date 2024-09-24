@@ -270,6 +270,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d77f7ec81a6d05a3abb01ab6eb7590f6083d08449fe5a1c8b1e620283546ccb7"
 
 [[package]]
+name = "htrime"
+version = "0.1.0"
+dependencies = [
+ "cairo-rs",
+ "env_logger",
+ "libc",
+ "log",
+ "wayland-client",
+ "wayland-egl",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "xkbcommon",
+]
+
+[[package]]
 name = "humantime"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -346,21 +361,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5de893c32cde5f383baa4c04c5d6dbdd735cfd4a794b0debdb2bb1b421da5ff4"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "my-gtk-app"
-version = "0.1.0"
-dependencies = [
- "cairo-rs",
- "env_logger",
- "libc",
- "log",
- "wayland-client",
- "wayland-egl",
- "wayland-protocols",
- "wayland-protocols-misc",
- "xkbcommon",
 ]
 
 [[package]]
